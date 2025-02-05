@@ -1,109 +1,201 @@
 from ortools.sat.python import cp_model
+from typing import Dict, List
 
-def samay_sarini(num_classes: int, num_periods: int, num_teachers: int):
-    # Diagnostic checks
-    print("\nAnalyzing parameters...")
-    
-    # Check 1: Basic teacher requirement
-    min_teachers_needed = num_classes
-    if num_teachers < min_teachers_needed:
-        print(f"❌ Not enough teachers: {num_teachers} teachers cannot cover {num_classes} classes simultaneously")
-        print(f"   Suggestion: Increase teachers to at least {min_teachers_needed}")
-        return
+DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
 
-    # Check 2: Teacher workload analysis
-    total_slots_needed = num_classes * num_periods
-    max_slots_per_teacher = 2 * num_classes  # max 2 periods per class
-    total_slots_available = num_teachers * max_slots_per_teacher
-    
-    print("\nCurrent parameters:")
-    print(f"- Classes: {num_classes}")
-    print(f"- Periods: {num_periods}")
-    print(f"- Teachers: {num_teachers}")
-    print(f"\nConstraint analysis:")
-    print(f"- Each teacher can teach max 2 periods per class")
-    print(f"- Total teaching slots needed: {total_slots_needed}")
-    print(f"- Total teaching slots available: {total_slots_available}")
-
-    if total_slots_available < total_slots_needed:
-        print(f"\n❌ Impossible configuration:")
-        print(f"   Need {total_slots_needed} slots but only {total_slots_available} available")
-        suggested_teachers = (total_slots_needed + max_slots_per_teacher - 1) // max_slots_per_teacher
-        print(f"\nSuggestions to fix:")
-        print(f"1. Increase teachers to at least {suggested_teachers}")
-        print(f"2. OR Decrease classes to {total_slots_available // num_periods}")
-        print(f"3. OR Increase periods to spread the load")
-        return
-
-    print("\n✓ Parameter check passed, attempting to find solution...")
-
+def samay_sarini(teachers: Dict, num_classes: int, num_periods: int):
     model = cp_model.CpModel()
+    
+    # Constants setup
+    FULL_DAY_PERIODS = num_periods
+    HALF_DAY_PERIODS = FULL_DAY_PERIODS - (FULL_DAY_PERIODS // 2)
+    num_teachers = len(teachers)
+    teacher_names = list(teachers.keys())
+    
+    # Create subject to teachers mapping
+    subject_to_teachers = {}
+    for teacher_name, teacher_data in teachers.items():
+        for subject in teacher_data['subjects']:
+            if subject not in subject_to_teachers:
+                subject_to_teachers[subject] = []
+            subject_to_teachers[subject].append(teacher_name)
 
-    X = {}
-    for c in range(num_classes):
-        for p in range(num_periods):
-            for t in range(num_teachers):
-                X[c, p, t] = model.NewBoolVar(f'teacher_{c}_{p}_{t}')
+    # Decision Variables
+    X = {}  # X[d, c, p, t] = 1 if teacher t teaches class c in period p on day d
+    for d in range(len(DAYS)):
+        max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+        for c in range(num_classes):
+            for p in range(max_periods):
+                for t in range(num_teachers):
+                    X[d, c, p, t] = model.NewBoolVar(f'teacher_{d}_{c}_{p}_{t}')
 
-    # Constraint: A teacher cannot be assigned to multiple classes in the same period
-    for p in range(num_periods):
-        for t in range(num_teachers):
-            model.Add(sum(X[c, p, t] for c in range(num_classes)) <= 1)
-
-    # Constraint: Each class must have exactly one teacher per period
-    for c in range(num_classes):
-        for p in range(num_periods):
-            model.Add(sum(X[c, p, t] for t in range(num_teachers)) == 1)
-
-    # Constraint: No teacher can teach more than 2 periods in any single class
+    # Create variables to track total periods for each teacher-class combination
+    total_periods = {}
     for t in range(num_teachers):
         for c in range(num_classes):
-            model.Add(sum(X[c, p, t] for p in range(num_periods)) <= 2)
+            total_periods[t, c] = model.NewIntVar(0, num_periods * len(DAYS), f'total_periods_{t}_{c}')
+            
+            # Link to actual assignments
+            periods = []
+            for d in range(len(DAYS)):
+                max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+                for p in range(max_periods):
+                    periods.append(X[d, c, p, t])
+            model.Add(total_periods[t, c] == sum(periods))
 
-    # Solve with time limit
+    # 1. No teacher in more than 1 class at a time
+    for d in range(len(DAYS)):
+        max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+        for p in range(max_periods):
+            for t in range(num_teachers):
+                model.Add(sum(X[d, c, p, t] for c in range(num_classes)) <= 1)
+
+    # Each class must have exactly one teacher per period
+    for d in range(len(DAYS)):
+        max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+        for c in range(num_classes):
+            for p in range(max_periods):
+                model.Add(sum(X[d, c, p, t] for t in range(num_teachers)) == 1)
+
+    # NEW: Subject should not be taught more than twice in a day
+    for d in range(len(DAYS)):
+        max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+        for c in range(num_classes):
+            for subject, subject_teachers in subject_to_teachers.items():
+                teacher_indices = [teacher_names.index(t) for t in subject_teachers]
+                daily_periods = []
+                for p in range(max_periods):
+                    for t in teacher_indices:
+                        daily_periods.append(X[d, c, p, t])
+                model.Add(sum(daily_periods) <= 2)
+
+    # Subject exclusivity (except for common subjects)
+    for subject, subject_teachers in subject_to_teachers.items():
+        if any(teachers[t].get('common_for_all_classes', False) for t in subject_teachers):
+            continue
+            
+        for c in range(num_classes):
+            teaches = {}
+            for teacher_name in subject_teachers:
+                t = teacher_names.index(teacher_name)
+                teaches[t] = model.NewBoolVar(f'teaches_{subject}_{c}_{t}')
+                
+                periods = []
+                for d in range(len(DAYS)):
+                    max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+                    for p in range(max_periods):
+                        periods.append(X[d, c, p, t])
+                
+                model.Add(sum(periods) > 0).OnlyEnforceIf(teaches[t])
+                model.Add(sum(periods) == 0).OnlyEnforceIf(teaches[t].Not())
+            
+            model.Add(sum(teaches[t] for t in teaches.keys()) == 1)
+
+    # First period homeroom teacher constraint
+    for c in range(num_classes):
+        model.Add(sum(X[0, c, 0, t] for t in range(num_teachers)) == 1)
+        
+        for t in range(num_teachers):
+            if teachers[teacher_names[t]].get('class_teacher_preference', False):
+                for d in range(1, len(DAYS)):
+                    model.Add(X[d, c, 0, t] == X[0, c, 0, t])
+
+    # No more than 2 consecutive periods
+    for d in range(len(DAYS)):
+        max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
+        for c in range(num_classes):
+            for p in range(max_periods - 2):
+                for t in range(num_teachers):
+                    consecutive_periods = [X[d, c, p+i, t] for i in range(3)]
+                    model.Add(sum(consecutive_periods) <= 2)
+
+    # Weekly period constraints
+    for teacher_name, teacher_data in teachers.items():
+        t = teacher_names.index(teacher_name)
+        weekly_limit = teacher_data.get('weekly_periods')
+        
+        if weekly_limit is not None:
+            for c in range(num_classes):
+                if teacher_data.get('common_for_all_classes', False):
+                    model.Add(total_periods[t, c] == weekly_limit)
+                else:
+                    model.Add(total_periods[t, c] <= weekly_limit)
+
+    # NEW: Balance teaching load
+    # Create variables for total periods per teacher across all classes
+    teacher_total_periods = {}
+    for t in range(num_teachers):
+        teacher_total_periods[t] = model.NewIntVar(0, num_periods * len(DAYS) * num_classes, f'teacher_total_{t}')
+        model.Add(teacher_total_periods[t] == sum(total_periods[t, c] for c in range(num_classes)))
+
+    # Create variables for the difference between max and min teaching load
+    max_teaching_load = model.NewIntVar(0, num_periods * len(DAYS) * num_classes, 'max_load')
+    min_teaching_load = model.NewIntVar(0, num_periods * len(DAYS) * num_classes, 'min_load')
+
+    # Link max and min variables
+    for t in range(num_teachers):
+        if not teachers[teacher_names[t]].get('weekly_periods'):  # Only for non-constrained teachers
+            model.Add(max_teaching_load >= teacher_total_periods[t])
+            model.Add(min_teaching_load <= teacher_total_periods[t])
+
+    # Objective: Maximize periods while minimizing the difference in teaching loads
+    objective_terms = []
+    for teacher_name, teacher_data in teachers.items():
+        t = teacher_names.index(teacher_name)
+        if not teacher_data.get('weekly_periods'):
+            for c in range(num_classes):
+                objective_terms.append(total_periods[t, c])
+    
+    # Add balance term to objective (with smaller weight)
+    load_difference = model.NewIntVar(0, num_periods * len(DAYS) * num_classes, 'load_diff')
+    model.Add(load_difference == max_teaching_load - min_teaching_load)
+    
+    if objective_terms:
+        model.Maximize(sum(objective_terms) - load_difference)
+
+    # Solve and print results
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 30.0  # 30 second timeout
+    solver.parameters.max_time_in_seconds = 300
+    solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
 
     if status == cp_model.FEASIBLE or status == cp_model.OPTIMAL:
         print("\n✓ Solution found!")
         
-        # Store the schedule for analysis
-        schedule = {}
-        for c in range(num_classes):
-            print(f"\nClass {c}")
-            print("-" * 20)
-            print("Period | Teacher")
-            print("-" * 20)
-            for p in range(num_periods):
-                for t in range(num_teachers):
-                    if solver.Value(X[c, p, t]):
-                        print(f"{p:6d} | {t:7d}")
-                        if p not in schedule:
-                            schedule[p] = set()
-                        schedule[p].add(t)
-        
-        # Print free teachers per period
-        print("\nFree Teachers Analysis:")
-        print("-" * 40)
-        print("Period | Free Teachers")
-        print("-" * 40)
-        for p in range(num_periods):
-            busy_teachers = schedule.get(p, set())
-            free_teachers = set(range(num_teachers)) - busy_teachers
-            free_count = len(free_teachers)
-            print(f"{p:6d} | {free_count:2d} teachers free: {sorted(free_teachers)}")
+        # Print schedule
+        for d in range(len(DAYS)):
+            print(f"\n{DAYS[d]}")
+            print("=" * 50)
+            max_periods = HALF_DAY_PERIODS if d == 5 else FULL_DAY_PERIODS
             
+            print(f"{'Period':8} | ", end="")
+            for c in range(num_classes):
+                print(f"Class {c:2} | ", end="")
+            print()
+            print("-" * 50)
+            
+            for p in range(max_periods):
+                print(f"{p:8} | ", end="")
+                for c in range(num_classes):
+                    teacher_assigned = None
+                    for t in range(num_teachers):
+                        if solver.Value(X[d, c, p, t]):
+                            teacher_assigned = teacher_names[t]
+                            break
+                    print(f"{teacher_assigned[:6]:8} | ", end="")
+                print()
+
+        # Print weekly totals and load distribution
+        print("\nWeekly periods per teacher per class:")
+        print("=" * 50)
+        for t in range(num_teachers):
+            teacher_name = teacher_names[t]
+            total = solver.Value(teacher_total_periods[t])
+            print(f"\n{teacher_name} (Total: {total} periods):")
+            for c in range(num_classes):
+                class_total = solver.Value(total_periods[t, c])
+                print(f"  Class {c}: {class_total} periods")
+                
     else:
         print("\n❌ No solution found!")
-        if status == cp_model.INFEASIBLE:
-            print("The problem is infeasible with current parameters.")
-        elif status == cp_model.MODEL_INVALID:
-            print("The model is invalid - please check parameters.")
-        else:
-            print("The solver timed out or failed to find a solution.")
-        
-        print("\nTry:")
-        print("1. Increasing the number of teachers")
-        print("2. Decreasing the number of classes")
-        print("3. Increasing the number of periods")
+        print("Try adjusting the constraints or increasing the solver time limit.")
